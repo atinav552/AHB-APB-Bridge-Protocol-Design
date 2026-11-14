@@ -1,5 +1,5 @@
 // =====================================================================
-// AHB to APB Bridge Protocol (Corrected & Synthesis-Clean)
+// AHB to APB Bridge Protocol
 // =====================================================================
 
 // ---------------------------------------------------------------------
@@ -24,9 +24,8 @@ module ahb_apb_bridge (
     output wire [31:0] hrdata
 );
 
-    wire [31:0] haddr1, haddr2;
-    wire [31:0] hwdata1, hwdata2;
-    wire        hwrite_reg, hwrite_reg1;
+    wire [31:0] haddr1;
+    wire        hwrite_reg;
     wire        valid;
     wire [2:0]  temp_sel, temp_sel_reg;
 
@@ -37,16 +36,11 @@ module ahb_apb_bridge (
         .hwrite(hwrite),
         .hready_in(hready_in),
         .haddr(haddr),
-        .hwdata(hwdata),
         .htrans(htrans),
         .prdata(prdata),
         .hrdata(hrdata),
         .haddr1(haddr1),
-        .haddr2(haddr2),
-        .hwdata1(hwdata1),
-        .hwdata2(hwdata2),
         .hwrite_reg(hwrite_reg),
-        .hwrite_reg1(hwrite_reg1),
         .valid(valid),
         .temp_sel(temp_sel),
         .temp_sel_reg(temp_sel_reg)
@@ -83,52 +77,31 @@ module ahb_slave_interface (
     input  wire        hwrite,
     input  wire        hready_in,
     input  wire [31:0] haddr,
-    input  wire [31:0] hwdata,
     input  wire [1:0]  htrans,
     input  wire [31:0] prdata,
     
     output wire [31:0] hrdata,
     output reg  [31:0] haddr1,
-    output reg  [31:0] haddr2,
-    output reg  [31:0] hwdata1,
-    output reg  [31:0] hwdata2,
     output reg         hwrite_reg,
-    output reg         hwrite_reg1,
-    output reg         valid,
+    output wire        valid,
     output reg  [2:0]  temp_sel,
     output reg  [2:0]  temp_sel_reg
 );
 
-    // 1. Pipeline Logic for haddr, hwdata, hwrite, and temp_sel
+    // 1. 1-Stage Pipeline Logic for haddr, hwrite, and temp_sel
     always @(posedge hclk) begin
         if (!hresetn) begin
             haddr1       <= 32'd0;
-            haddr2       <= 32'd0;
-            hwdata1      <= 32'd0;
-            hwdata2      <= 32'd0;
             hwrite_reg   <= 1'b0;
-            hwrite_reg1  <= 1'b0;
             temp_sel_reg <= 3'b000;
         end else begin
             haddr1       <= haddr;
-            haddr2       <= haddr1;
-            hwdata1      <= hwdata;
-            hwdata2      <= hwdata1;
             hwrite_reg   <= hwrite;
-            hwrite_reg1  <= hwrite_reg;
             temp_sel_reg <= temp_sel;
         end
     end
 
-    // 2. Validate Signal based on Address Range and Trans type (NONSEQ=10, SEQ=11)
-    always @(*) begin
-        valid = 1'b0;
-        if ((hready_in == 1'b1) && (haddr >= 32'h8000_0000 && haddr < 32'h8C00_0000) && (htrans == 2'b10 || htrans == 2'b11)) begin
-            valid = 1'b1;
-        end
-    end
-
-    // 3. Peripheral Selection Logic
+    // 2. Peripheral Selection Logic
     always @(*) begin
         temp_sel = 3'b000;
         if (haddr >= 32'h8000_0000 && haddr < 32'h8400_0000)
@@ -138,7 +111,9 @@ module ahb_slave_interface (
         else if (haddr >= 32'h8800_0000 && haddr < 32'h8C00_0000)
             temp_sel = 3'b100;
     end
-    
+
+    // 3. Validate Signal (Reuses temp_sel range check & checks htrans[1] for NONSEQ/SEQ)
+    assign valid  = hready_in && (|temp_sel) && htrans[1];
     assign hrdata = prdata;
 
 endmodule
@@ -188,41 +163,26 @@ module apb_fsm_controller (
         else          state <= next_state;
     end
 
-    // Next State Logic
+    // Next State Logic (Grouped & Simplified)
     always @(*) begin
         next_state = ST_IDLE;
         case(state)
-            ST_IDLE: begin
-                if (valid && hwrite)       next_state = ST_WWAIT;
-                else if (valid && !hwrite) next_state = ST_READ;
+            ST_IDLE, ST_RENABLE, ST_WENABLE: begin
+                if (valid) next_state = hwrite ? ST_WWAIT : ST_READ;
             end
-            ST_READ: next_state = ST_RENABLE;
-            ST_RENABLE: begin
-                if (valid && !hwrite)      next_state = ST_READ;
-                else if (valid && hwrite)  next_state = ST_WWAIT;
-            end     
-            ST_WWAIT: begin
-                if (valid)                 next_state = ST_WRITEP;
-                else                       next_state = ST_WRITE;             
-            end              
-            ST_WRITE: begin
-                if (!valid)                next_state = ST_WENABLE;
-                else                       next_state = ST_WENABLEP;      
-            end
+            ST_READ:   next_state = ST_RENABLE;
+            ST_WWAIT:  next_state = valid ? ST_WRITEP   : ST_WRITE;
+            ST_WRITE:  next_state = valid ? ST_WENABLEP : ST_WENABLE;
             ST_WRITEP: next_state = ST_WENABLEP;        
             ST_WENABLEP: begin
-                if (!hwrite_reg)               next_state = ST_READ;
-                else if (valid && hwrite_reg)  next_state = ST_WRITEP;
-                else if (!valid && hwrite_reg) next_state = ST_WRITE;
+                if (!hwrite_reg) next_state = ST_READ;
+                else if (valid)  next_state = ST_WRITEP;
+                else             next_state = ST_WRITE;
             end
-            ST_WENABLE: begin
-                if (valid && !hwrite)      next_state = ST_READ;
-                else if (valid && hwrite)  next_state = ST_WWAIT;
-            end 
         endcase
     end
 
-    // Combinatorial Look-Ahead Outputs
+    // Combinatorial Look-Ahead Outputs (Merged Duplicate Cases)
     always @(*) begin
         paddr_tmp      = paddr;
         pwdata_tmp     = pwdata;
@@ -240,27 +200,22 @@ module apb_fsm_controller (
                     psel_tmp       = temp_sel;
                     penable_tmp    = 1'b0;
                     hready_out_tmp = 1'b0;                
-                end else if (valid && hwrite) begin
-                    // Transitioning to ST_WWAIT (Wait 1 cycle for hwdata)
-                    psel_tmp       = 3'b000;
-                    penable_tmp    = 1'b0;
-                    hready_out_tmp = 1'b1;                        
                 end else begin
-                    // Returning to ST_IDLE
+                    // Transitioning to ST_WWAIT or returning to ST_IDLE
                     psel_tmp       = 3'b000;
                     penable_tmp    = 1'b0;
                     hready_out_tmp = 1'b1;                    
                 end
             end
 
-            ST_READ: begin
-                // Transitioning to ST_RENABLE (APB Read Enable)
+            ST_READ, ST_WRITE, ST_WRITEP: begin
+                // Transitioning to Enable Phase (ST_RENABLE, ST_WENABLE, or ST_WENABLEP)
                 penable_tmp    = 1'b1;
                 hready_out_tmp = 1'b1;
             end
 
-            ST_WWAIT: begin 
-                // Transitioning to ST_WRITE or ST_WRITEP (APB Write Setup using pipelined address)
+            ST_WWAIT, ST_WENABLEP: begin 
+                // Transitioning to Setup Phase using pipelined address (haddr1)
                 paddr_tmp      = haddr1;  
                 pwdata_tmp     = hwdata;
                 pwrite_tmp     = hwrite_reg;
@@ -268,22 +223,6 @@ module apb_fsm_controller (
                 penable_tmp    = 1'b0;
                 hready_out_tmp = 1'b0;
             end
-
-            ST_WRITE, ST_WRITEP: begin
-                // Transitioning to ST_WENABLE or ST_WENABLEP (APB Write Enable)
-                penable_tmp    = 1'b1;
-                hready_out_tmp = 1'b1;
-            end   
-
-            ST_WENABLEP: begin
-                // Transitioning to ST_READ, ST_WRITE, or ST_WRITEP using queued haddr1
-                paddr_tmp      = haddr1;
-                pwdata_tmp     = hwdata;
-                pwrite_tmp     = hwrite_reg;
-                psel_tmp       = temp_sel_reg;
-                penable_tmp    = 1'b0;
-                hready_out_tmp = 1'b0;
-            end            
         endcase
     end    
 
